@@ -238,6 +238,13 @@ task importMinimalElasticsearch(dependsOn: buildElasticsearchLocalDistro) {
                 include jarPackageNamed("spi/elasticsearch-scripting-painless-spi")
             }
 
+            from("${elasticsearchBuildTree}/modules/ingest-geoip") {
+                include jarPackageNamed("ingest-geoip")
+                include jarPackageNamed("maxmind-db")
+                include jarPackageNamed("geoip2")
+                // TODO: shaded jackson?
+            }
+
             into project.file('local_libs')
 
             includeEmptyDirs(false)
