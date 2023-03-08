@@ -9,6 +9,9 @@ class LogStash::Filters::ElasticIntegration < LogStash::Filters::Base
   require_relative "elastic_integration/event_api_bridge"
   include EventApiBridge
 
+  require_relative "elastic_integration/geo_ip_database_provider_support"
+  include GeoIpDatabaseProviderSupport
+
   config_name "elastic_integration"
 
   java_import('co.elastic.logstash.filters.elasticintegration.PluginConfiguration')
@@ -16,6 +19,7 @@ class LogStash::Filters::ElasticIntegration < LogStash::Filters::Base
   java_import('co.elastic.logstash.filters.elasticintegration.EventProcessorBuilder')
   java_import('co.elastic.logstash.filters.elasticintegration.ElasticsearchRestClientBuilder')
   java_import('co.elastic.logstash.filters.elasticintegration.PreflightCheck')
+  java_import('org.elasticsearch.ingest.geoip.GeoIpProcessor')
 
   ELASTICSEARCH_DEFAULT_PORT = 9200.freeze
   ELASTICSEARCH_DEFAULT_PATH = '/'.freeze
@@ -311,6 +315,7 @@ class LogStash::Filters::ElasticIntegration < LogStash::Filters::Base
 
     @event_processor = EventProcessorBuilder.fromElasticsearch(@elasticsearch_rest_client)
                                             .setFilterMatchListener(method(:filter_matched_java).to_proc)
+                                            .addProcessor("geoip", lambda { GeoIpProcessor::Factory.new(geo_ip_database_provider) })
                                             .build("logstash.filter.elastic_integration.#{id}.#{__id__}")
   rescue => exception
     raise_config_error!("configuration did not produce an EventProcessor: #{exception}")

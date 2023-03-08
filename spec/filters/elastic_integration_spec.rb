@@ -13,6 +13,17 @@ describe LogStash::Filters::ElasticIntegration do
     }
   end
 
+  before(:each) do
+    stub_const('LogStash::Environment::LOGSTASH_HOME', ENV['LOGSTASH_PATH'])
+
+    dir_path = Stud::Temporary.directory
+    File.open(dir_path + '/uuid', 'w') { |f| f.write(SecureRandom.uuid) }
+    allow(LogStash::SETTINGS).to receive(:get).and_call_original
+    allow(LogStash::SETTINGS).to receive(:get).with("xpack.geoip.downloader.enabled").and_return(true)
+    allow(LogStash::SETTINGS).to receive(:get).with("xpack.geoip.download.endpoint").and_return(nil)
+    allow(LogStash::SETTINGS).to receive(:get).with("path.data").and_return(dir_path)
+  end
+
   subject(:plugin) { LogStash::Filters::ElasticIntegration.new(config) }
 
   describe 'the plugin class' do
