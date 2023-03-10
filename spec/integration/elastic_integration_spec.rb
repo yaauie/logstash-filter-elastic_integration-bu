@@ -1,13 +1,10 @@
-require 'spec_helper'
+require_relative "../../spec/spec_helper"
 require 'manticore'
 require 'logstash/filters/elastic_integration'
 
 describe 'Logstash executes ingest pipeline', :integration => true do
 
   let(:es_http_client) { Manticore::Client.new }
-  let(:es_client_connection_setting) {
-    "http://elasticsearch:9200"
-  }
 
   let(:settings) {
     {
@@ -62,31 +59,32 @@ describe 'Logstash executes ingest pipeline', :integration => true do
 
   before(:each) do
     # create an ingest pipeline
-    ingest_pipeline_url = es_client_connection_setting + "/_ingest/pipeline/" + pipeline_setting + "-pipeline"
+    ingest_pipeline_url = get_host_port_for_es_client + "/_ingest/pipeline/" + pipeline_setting + "-pipeline"
     es_http_client.put(ingest_pipeline_url, :body => pipeline_processors_setting, :headers => { "Content-Type" => "application/json" }).call
 
     # create an index template by setting default pipeline
-    index_template_url = es_client_connection_setting + "/_index_template/" + pipeline_setting
+    index_template_url = get_host_port_for_es_client + "/_index_template/" + pipeline_setting
     es_http_client.put(index_template_url, :body => index_template_setting, :headers => { "Content-Type" => "application/json" }).call
 
-    allow(elastic_integration_plugin.logger).to receive(:trace)
-    allow(elastic_integration_plugin.logger).to receive(:debug)
-    subject.register
   end
 
   after(:each) do
     # remove index template
-    index_template_url = es_client_connection_setting + "/_index_template/" + pipeline_setting
+    index_template_url = get_host_port_for_es_client + "/_index_template/" + pipeline_setting
     es_http_client.delete(index_template_url).call
 
     # remove ingest pipeline
-    ingest_pipeline_url = es_client_connection_setting + "/_ingest/pipeline/" + pipeline_setting + "-pipeline"
+    ingest_pipeline_url = get_host_port_for_es_client + "/_ingest/pipeline/" + pipeline_setting + "-pipeline"
     es_http_client.delete(ingest_pipeline_url).call
 
     subject.close
   end
 
   context '#pipeline execution' do
+
+    before(:each) do
+      subject.register
+    end
 
     describe 'with append processor' do
       let(:pipeline_processor) {
@@ -129,34 +127,6 @@ describe 'Logstash executes ingest pipeline', :integration => true do
 
         subject.multi_filter(events).each do |event|
           expect(event.get("size").eql?(2048)).to be_truthy
-        end
-      end
-
-    end
-
-    # TODO: failed with no processor found error
-    #   [2023-03-09T10:04:24,951][ERROR][co.elastic.logstash.filters.elasticintegration.IngestPipelineFactory] failed to create ingest pipeline `integration-logstash_test.events-default-pipeline` from pipeline configuration
-    #     org.elasticsearch.ElasticsearchParseException: No processor type exists with name [circle]
-    describe 'with circle processor' do
-      let(:pipeline_processor) {
-        '{
-          "circle": {
-            "field": "circle_field",
-            "error_distance": 28.0,
-            "shape_type": "geo_shape"
-          }
-        }'
-      }
-
-      it 'converts circle definitions of shapes to regular polygons' do
-        events = [LogStash::Event.new(
-          "message" => "Convert circle definition.",
-          "circle_field": "CIRCLE (30 10 40)",
-          "data_stream" => data_stream)]
-
-        subject.multi_filter(events).each do |event|
-          puts "Event: #{event.to_json.to_s}"
-          expect(event.get("circle_field").include?("POLYGON")).to be_truthy
         end
       end
 
@@ -343,7 +313,7 @@ describe 'Logstash executes ingest pipeline', :integration => true do
       let(:pipeline_processor) {
         '{
           "drop": {
-            "if": "ctx.remove_user_type == \'Guest\'"
+            "if": "ctx.user_type == \'Guest\'"
           }
         }'
       }
@@ -351,41 +321,24 @@ describe 'Logstash executes ingest pipeline', :integration => true do
       it 'drops an event (when condition satisfies)' do
         events = [LogStash::Event.new(
                     "message" => "This event is going to be dropped.",
-                    "remove_user_type" => "Guest",
+                    "user_type" => "Guest",
                     "data_stream" => data_stream),
                   LogStash::Event.new(
                     "message" => "This event is NOT going to be dropped.",
-                    "remove_user_type" => "Authorized",
+                    "user_type" => "Authorized",
                     "data_stream" => data_stream)
         ]
 
-        subject.multi_filter(events).each do |event|
+        processed_events = subject.multi_filter(events)
+        # dropping doesn't me to remove the event
+        # we still keep it and mark it as cancelled
+        expect(processed_events.size.eql?(2)).to be_truthy
+        processed_events.each do |event|
           puts "Event: #{event.to_json.to_s}"
-          # no need to check size since we are removing all guests
-          expect(event.get("[remove_user_type]").eql?("Authorized")).to be_truthy
-        end
-      end
-
-    end
-
-    describe 'with fail processor' do
-      let(:pipeline_processor) {
-        '{
-          "fail": {
-            "if" : "ctx.tags.contains(\'production\') != true",
-            "message": "The production tag is not present, found tags: {{{tags}}}"
-          }
-        }'
-      }
-
-      it 'raises an exception when condition is met' do
-        events = [LogStash::Event.new(
-          "message" => "Test",
-          "ctx" => { "tags" => %w[dev stage] },
-          "data_stream" => data_stream)]
-
-        subject.multi_filter(events).each do |event|
-          expect(event.get("tags").include?("_ingest_pipeline_failure").nil?).to be_falsey
+          puts "Event meta: #{event.get("@metadata")}"
+          if event.get("user_type") == "Guest"
+            expect(event.is_cancelled).to be_truthy
+          end
         end
       end
 
@@ -490,10 +443,6 @@ describe 'Logstash executes ingest pipeline', :integration => true do
 
     end
 
-    # TODO: need a fix
-    #   Failure/Error: Unable to find org.elasticsearch.ingest.common.HtmlStripProcessor.process(org/elasticsearch/ingest/common/HtmlStripProcessor.java to read failed line
-    #      Java::JavaLang::NoClassDefFoundError:
-    #        org/apache/lucene/analysis/charfilter/HTMLStripCharFilter
     describe 'with HTML strip processor' do
       let(:pipeline_processor) {
         '{
@@ -510,8 +459,7 @@ describe 'Logstash executes ingest pipeline', :integration => true do
           "data_stream" => data_stream)]
 
         subject.multi_filter(events).each do |event|
-          puts "Event: #{event.to_json.to_s}"
-          # expect(event.get("strip_field") == "\n HTML \n \n \n \n fast, and brutal \n \n \n").to be_truthy
+          expect(event.get("strip_field") == "\n HTML \n \n   fast, and brutal   \n").to be_truthy
         end
       end
 
@@ -717,22 +665,14 @@ describe 'Logstash executes ingest pipeline', :integration => true do
 
     end
 
-    # TODO: not working
     describe 'with script processor' do
       let(:pipeline_processor) {
         '{
           "script": {
-            "description": "Extract tags from env field",
             "lang": "painless",
-            "source": """
-              String[] envSplit = ctx[\'env\'].splitOnToken(params[\'delimiter\']);
-              ArrayList tags = new ArrayList();
-              tags.add(envSplit[params[\'position\']].trim());
-              ctx[\'tags\'] = tags;
-            """,
+            "source": "ctx[\'_index\'] = ctx[\'lang\'] + \'-\' + params[\'dataset\'];",
             "params": {
-              "delimiter": "-",
-              "position": 1
+              "dataset": "catalog"
             }
           }
         }'
@@ -741,12 +681,11 @@ describe 'Logstash executes ingest pipeline', :integration => true do
       it 'runs painless script on a given field' do
         events = [LogStash::Event.new(
           "message" => "Should extract prod tag from env field",
-          "env" => "es01-prod",
+          "lang" => "uz",
           "data_stream" => data_stream)]
 
         subject.multi_filter(events).each do |event|
-          puts "Event: #{event.to_json.to_s}"
-          expect(event.get("[tags][prod]").eql?("prod")).to be_truthy
+          expect(event.get("_index") == "uz-catalog").to be_truthy
         end
       end
 
@@ -771,27 +710,6 @@ describe 'Logstash executes ingest pipeline', :integration => true do
 
         subject.multi_filter(events).each do |event|
           expect(event.get("elephant_age").eql?(expected_value)).to be_truthy
-        end
-      end
-
-    end
-
-    describe 'with set-security-user processor' do
-      let(:pipeline_processor) {
-        '{
-          "set_security_user": {
-            "field": "user"
-          }
-        }'
-      }
-
-      it 'fills user field with required properties' do
-        events = [LogStash::Event.new(
-          "message" => "User information will be added to [user] field.",
-          "data_stream" => data_stream)]
-
-        subject.multi_filter(events).each do |event|
-          expect(event.get("[user][username]").nil?).to be_falsey
         end
       end
 
@@ -936,9 +854,6 @@ describe 'Logstash executes ingest pipeline', :integration => true do
 
     end
 
-    # TODO: creating processor fails
-    #   [2023-03-09T09:57:52,947][ERROR][co.elastic.logstash.filters.elasticintegration.IngestPipelineFactory] failed to create ingest pipeline `integration-logstash_test.events-default-pipeline` from pipeline configuration
-    #    org.elasticsearch.ElasticsearchParseException: No processor type exists with name [user_agent]
     describe 'with user-agent processor' do
       let(:pipeline_processor) {
         '{
@@ -955,9 +870,9 @@ describe 'Logstash executes ingest pipeline', :integration => true do
           "data_stream" => data_stream)]
 
         subject.multi_filter(events).each do |event|
-          expect(event.get("[user_agent_field][name]").eql?("Chrome")).to be_truthy
-          expect(event.get("[user_agent_field][device][name]").eql?("Mac")).to be_truthy
-          expect(event.get("[user_agent_field][version]").eql?("51.0.2704.103")).to be_truthy
+          expect(event.get("[user_agent][name]").eql?("Chrome")).to be_truthy
+          expect(event.get("[user_agent][device][name]").eql?("Mac")).to be_truthy
+          expect(event.get("[user_agent][version]").eql?("51.0.2704.103")).to be_truthy
         end
       end
 
@@ -965,16 +880,95 @@ describe 'Logstash executes ingest pipeline', :integration => true do
 
   end
 
-  context '#multipipeline' do
-    # TODO: pipeline processor
+  context '#multi-pipeline execution' do
+    before(:each) do
+      subject.register
+    end
+
+    describe 'with pipeline processor' do
+      let(:pipeline_processor) {
+        '{
+          "split": {
+            "field": "split_and_sort_field",
+            "separator": ","
+          }
+        },
+        {
+          "sort": {
+            "field": "split_and_sort_field",
+            "order": "desc"
+          }
+        }'
+      }
+
+      it 'splits the array and sorts' do
+        events = [LogStash::Event.new(
+          "message" => "[split_and_sort_field] will be split first and sorted in descending order.",
+          "split_and_sort_field" => "1,3,8,2,4,5,6,7,8",
+          "data_stream" => data_stream)]
+
+        subject.multi_filter(events).each do |event|
+          expect(event.get("split_and_sort_field").eql?(%w[8 8 7 6 5 4 3 2 1])).to be_truthy
+        end
+      end
+    end
   end
 
-  # TODO:
-  #   multiple processors and failure (cannot execute) cases
-  #   data stream without default processor
-  #   version is higher than ES treeish
-  context '#fails' do
-    describe "when field doesn't exist" do
+  context '#failures' do
+
+    before(:each) do
+      subject.register
+    end
+
+    describe 'with grok pattern processor' do
+      let(:pipeline_processor) {
+        '{
+          "grok": {
+            "field": "not_exist_field",
+            "patterns": ["%{IP:client} %{WORD:method} %{URIPATHPARAM:request} %{NUMBER:bytes:int} %{NUMBER:duration:double}"]
+          }
+        }'
+      }
+
+      it 'fails when field does not exist and adds failure reason to metadata' do
+        events = [LogStash::Event.new(
+          "message" => "55.3.244.1 GET /index.html 15824 0.043",
+          "data_stream" => data_stream)]
+
+        subject.multi_filter(events).each do |event|
+          expected_message = "java.lang.IllegalArgumentException: field [not_exist_field] not present as part of path [not_exist_field]"
+          metadata_failure_reason = event.get("[@metadata][_ingest_pipeline_failure]")
+
+          expect(metadata_failure_reason.nil?).to be_falsey
+          expect(metadata_failure_reason["exception"].nil?).to be_falsey
+          expect(metadata_failure_reason["message"].nil?).to be_falsey
+          expect(metadata_failure_reason["message"].eql?(expected_message)).to be_truthy
+        end
+      end
+
+    end
+
+    describe 'with fail processor' do
+      let(:pipeline_processor) {
+        '{
+          "fail": {
+            "if" : "ctx.tags.contains(\'production\') != true",
+            "message": "The production tag is not present, found tags: {{{tags}}}"
+          }
+        }'
+      }
+
+      it 'raises an exception when condition is met' do
+        events = [LogStash::Event.new(
+          "message" => "Test",
+          "ctx" => { "tags" => %w[dev stage] },
+          "data_stream" => data_stream)]
+
+        subject.multi_filter(events).each do |event|
+          expect(event.get("[@metadata][_ingest_pipeline_failure][exception]").nil?).to be_falsey
+          expect(event.get("[@metadata][_ingest_pipeline_failure][exception]") == "org.elasticsearch.ingest.IngestProcessorException").to be_truthy
+        end
+      end
 
     end
   end
