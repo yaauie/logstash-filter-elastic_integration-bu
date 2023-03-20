@@ -2,13 +2,33 @@ require_relative "../../spec/spec_helper"
 require 'manticore'
 require 'logstash/filters/elastic_integration'
 
-describe 'Logstash executes ingest pipeline', :integration => true do
+## This plugin uses /_security/user/_has_privileges API which
+# requires xpack enabled & SSL enabled
+describe 'Logstash executes ingest pipeline', :secure_integration => true do
 
-  let(:es_http_client) { Manticore::Client.new }
+  let(:es_http_client_options) {
+    {
+      ssl: {
+        ca_file: 'spec/fixtures/test_certs/ca.crt',
+        client_cert: 'spec/fixtures/test_certs/test.crt',
+        client_key: 'spec/fixtures/test_certs/test.key'
+      }
+    }
+  }
+  let(:es_http_client) { Manticore::Client.new(es_http_client_options) }
 
+  let(:integ_user_name) { "admin" }
+  let(:integ_user_password) { "elastic" }
   let(:settings) {
     {
-      "hosts" => "http://elasticsearch:9200"
+      "hosts" => "https://@elasticsearch:9200",
+      "auth_basic_username" => integ_user_name,
+      "auth_basic_password" => integ_user_password,
+      "ssl_enabled" => true,
+      "ssl_certificate_authorities" => "spec/fixtures/test_certs/ca.crt",
+      "ssl_certificate" => "spec/fixtures/test_certs/test.crt",
+      "ssl_key" => "spec/fixtures/test_certs/test.key",
+      "ssl_key_passphrase" => "1234567890"
     }
   }
 
@@ -36,15 +56,18 @@ describe 'Logstash executes ingest pipeline', :integration => true do
   let(:pipeline_processors_setting) {
     '{
       "processors" : [
-        '+ pipeline_processor + '
+        ' + pipeline_processor + '
       ]
     }'
   }
-  let(:pipeline_processor) {{}}
+  let(:pipeline_processor) {}
 
+  let(:index_pattern) {
+    "logs-logstash-*"
+  }
   let(:index_template_setting) { '
     {
-      "index_patterns": ["logs-logstash-*"],
+      "index_patterns": ["' + index_pattern + '"],
       "data_stream": { },
       "template": {
         "settings": {
@@ -970,6 +993,227 @@ describe 'Logstash executes ingest pipeline', :integration => true do
         end
       end
 
+    end
+  end
+
+  context '#privileges' do
+    # a user who doesn't have pipeline privileges
+    let(:integ_user_name) {
+      "ls_integration_tests_user"
+    }
+    let(:integ_user_password) {
+      "l0ng-r4nd0m-p@ssw0rd"
+    }
+
+    let(:settings) {
+      {
+        "hosts" => "https://elasticsearch:9200",
+        "auth_basic_username" => integ_user_name,
+        "auth_basic_password" => integ_user_password
+      }
+    }
+
+    let(:ls_integration_tests_user_info) {
+      '{
+        "password" : "' + integ_user_password + '",
+        "roles" : [ "ls_integration_tests_role" ],
+        "full_name" : "Logstash Integration",
+        "email" : "ls_integration@elastic.co",
+        "metadata" : {
+          "intelligence" : 7
+        }
+      }'
+    }
+
+    let(:pipeline_processor) {
+      '{
+          "append": {
+            "field": "append_field",
+            "value": ["integration", "test"]
+          }
+        }'
+    }
+
+    before(:each) do
+      es_http_client.post(get_host_port_for_es_client + "/_security/role/ls_integration_tests_role", :body => ls_integration_tests_role, :headers => { "Content-Type" => "application/json" }).call
+      es_http_client.post(get_host_port_for_es_client + "/_security/user/" + integ_user_name, :body => ls_integration_tests_user_info, :headers => { "Content-Type" => "application/json" }).call
+    end
+
+    after(:each) do
+      es_http_client.delete(get_host_port_for_es_client + "/_security/user/" + integ_user_name).call
+      es_http_client.delete(get_host_port_for_es_client + "/_security/role/ls_integration_tests_role").call
+    end
+
+    describe 'with an unprivileged role' do
+      # a role with empty privileges
+      let(:ls_integration_tests_role) {
+        '{
+          "run_as": [],
+          "cluster": [],
+          "indices": []
+        }'
+      }
+
+      it "ensures that user doesn't have privileges to read pipelines and cannot execute pipeline" do
+        # plugin register fails
+        expected_message = "The cluster privilege `monitor` is REQUIRED in order to validate Elasticsearch license"
+        expect{ subject.register }.to raise_error(LogStash::ConfigurationError).with_message(expected_message)
+
+        # send event and check
+        events = [LogStash::Event.new(
+          "message" => "'integration' and 'test' are to append to [append_field] field.",
+          "append_field" => "Append to me.",
+          "data_stream" => data_stream)]
+
+        subject.multi_filter(events).each do |event|
+          expect(event.get("[@metadata][_ingest_pipeline_failure][message]").include?("action [indices:admin/index_template/simulate] is unauthorized for user [ls_integration_tests_user]")).to be_truthy
+        end
+      end
+    end
+
+    describe 'with a privileged user' do
+      # a role with ["monitor", "read_pipeline", "manage_index_templates"] privileges
+      let(:ls_integration_tests_role) {
+        '{
+          "run_as": [],
+          "cluster": ["monitor", "read_pipeline", "manage_index_templates"],
+          "indices": []
+        }'
+      }
+
+      it 'appends values to the field' do
+        expect{ subject.register }.not_to raise_error
+
+        expected_append_field = ["Append to me.","integration","test"]
+        events = [LogStash::Event.new(
+          "message" => "'integration' and 'test' are to append to [append_field] field.",
+          "append_field" => "Append to me.",
+          "data_stream" => data_stream)]
+
+        subject.multi_filter(events).each do |event|
+          expect(event.get("append_field") == expected_append_field).to be_truthy
+        end
+      end
+    end
+
+  end
+
+  context '#emulating real scenario' do
+    let(:index_settings) {
+      {
+        "type" => "log",
+        "dataset" => "tomcat.events",
+        "namespace" => "default"
+      }
+    }
+
+    let(:pipeline_processors_setting) {
+      '{
+        "processors": [
+         {
+           "grok": {
+              "field": "message",
+              "patterns": ["%{TOMCATLOG}"]
+            }
+         },
+         {
+            "date": {
+              "field": "timestamp",
+              "formats": [
+                "yyyy-MM-dd HH:mm:ss,SSS ZZZ"
+              ]
+            }
+         },
+         {
+            "remove": {
+              "field": "message"
+            }
+         }
+        ]
+      }'
+    }
+
+    let(:index_pattern) {
+      "logs-tomcat-*"
+    }
+
+    before(:each) do
+      subject.register
+    end
+
+    it 'processes tomcat logs' do
+      events = [
+        LogStash::Event.new(
+          "message" => "2023-03-16 16:32:37,706 +0500 | DEBUG | o.s.b.w.s.ServletContextInitializerBeans - Mapping filters: characterEncodingFilter urls=[/*] order=-2147483648, formContentFilter urls=[/*] order=-9900, requestContextFilter urls=[/*] order=-105",
+          "data_stream" => data_stream),
+        LogStash::Event.new(
+          "message" => "2023-03-16 16:32:40,212 +0500 | WARN | JpaBaseConfiguration$JpaWebConfiguration - spring.jpa.open-in-view is enabled by default. Therefore, database queries may be performed during view rendering. Explicitly configure spring.jpa.open-in-view to disable this warning",
+          "data_stream" => data_stream),
+        LogStash::Event.new(
+          "message" => "2023-03-16 17:36:10,957 +0500 | WARN | com.zaxxer.hikari.pool.HikariPool - HikariPool-1 - Thread starvation or clock leap detected (housekeeper delta=17m631ms).",
+          "data_stream" => data_stream),
+        LogStash::Event.new(
+          "message" => "2023-03-16 16:32:40,399 +0500 | INFO | o.s.b.w.embedded.tomcat.TomcatWebServer - Tomcat started on port(s): 8080 (http) with context path ''",
+          "data_stream" => data_stream),
+        LogStash::Event.new(
+          "message" => "2023-03-16 18:26:33,267 +0500 | ERROR | o.a.c.c.C.DispatcherServlet - Servlet.service() for servlet [dispatcherServlet] in context with path [] threw exception [Request processing failed; nested exception is uz.tatu.hotelbookingservice.common.exceptions.NoHotelFoundException: Hotel ID not found: 5] with root cause
+            uz.tatu.hotelbookingservice.common.exceptions.NoHotelFoundException: Hotel ID not found: 5
+            at uz.tatu.hotelbookingservice.service.HotelBookingService.hotel(HotelBookingService.java:27) ~[classes/:na]
+            ...",
+          "data_stream" => data_stream)
+      ]
+
+      subject.multi_filter(events).each do |event|
+        if event.get("tags")
+          expect(event.get("tags").include?("_ingest_pipeline_failure")).to be_falsey
+        end
+      end
+    end
+
+  end
+
+  # TODO
+  #  - add SSL failure case (PKIX: unable to find valid certification path to requested target)
+  context '#SSL' do
+    before(:each) do
+      subject.register
+    end
+
+    describe 'when using self-signed certificate' do
+      let(:settings) {
+        super().merge(
+          "ssl_enabled" => true,
+          "ssl_certificate_authorities" => "spec/fixtures/test_certs/ca.crt",
+          "ssl_certificate" => "spec/fixtures/test_certs/test.crt",
+          "ssl_key" => "spec/fixtures/test_certs/test.key",
+          "ssl_key_passphrase" => "1234567890"
+        )
+      }
+
+      let(:pipeline_processor) {
+        '{
+          "dissect": {
+            "field": "dissect_field",
+            "pattern" : "%{clientip} %{ident} %{auth} [%{@timestamp}] \"%{verb} %{request} HTTP/%{httpversion}\" %{status} %{size}"
+          }
+        }'
+      }
+
+      it 'parses the field based on the pattern' do
+        events = [LogStash::Event.new(
+          "message" => "Parses Nginx single line log.",
+          "dissect_field" => "1.2.3.4 - - [01/Apr/2023:22:00:52 +0000] \"GET /path/to/some/resources/test.gif HTTP/1.0\" 200 3171",
+          "data_stream" => data_stream)]
+
+        subject.multi_filter(events).each do |event|
+          expect(event.get("clientip").eql?("1.2.3.4")).to be_truthy
+          expect(event.get("@timestamp").eql?("01/Apr/2023:22:00:52 +0000")).to be_truthy
+          expect(event.get("verb").eql?("GET")).to be_truthy
+          expect(event.get("request").eql?("/path/to/some/resources/test.gif")).to be_truthy
+          expect(event.get("status").eql?("200")).to be_truthy
+          expect(event.get("size").eql?("3171")).to be_truthy
+        end
+      end
     end
   end
 

@@ -6,7 +6,7 @@ module SpecHelper
 
   def get_host_port_for_es_client
     if ENV["INTEGRATION"] == "true"
-      host = "elasticsearch:9200"
+      host = "admin:elastic@elasticsearch:9200"
       ENV["SECURE_INTEGRATION"] == "true" ? "https://" + host : "http://" + host
     else
       "http://localhost:9200"
