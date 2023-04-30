@@ -62,8 +62,12 @@ public class IngestDuplexMarshaller {
         // we copy the entirety of the event's top-level fields into this _except_ the @timestamp and @version
         // which have special handling below
         event.getData().forEach((eventKey, eventValue) -> {
-            if (eventKey.equals(org.logstash.Event.TIMESTAMP) || eventKey.equals(org.logstash.Event.VERSION)) {
-                // no-op; handled outside of iteration
+            // keep @timestamp and @version fields as it is to make available
+            // to ingest pipelines (such as apache ingest pipelines) who proceed any operations on them
+            if (eventKey.equals(org.logstash.Event.TIMESTAMP)) {
+                sourceAndMetadata.putIfAbsent(org.logstash.Event.TIMESTAMP, event.getField(org.logstash.Event.TIMESTAMP));
+            } else if (eventKey.equals(org.logstash.Event.VERSION)) {
+                sourceAndMetadata.putIfAbsent(org.logstash.Event.VERSION, event.getField(org.logstash.Event.VERSION));
             } else {
                 sourceAndMetadata.put(eventKey, Javafier.deep(eventValue));
             }
