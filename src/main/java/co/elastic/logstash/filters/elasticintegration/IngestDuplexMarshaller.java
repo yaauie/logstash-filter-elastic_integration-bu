@@ -65,7 +65,14 @@ public class IngestDuplexMarshaller {
             // keep @timestamp and @version fields as it is to make available
             // to ingest pipelines (such as apache ingest pipelines) who proceed any operations on them
             if (eventKey.equals(org.logstash.Event.TIMESTAMP)) {
-                sourceAndMetadata.putIfAbsent(org.logstash.Event.TIMESTAMP, event.getField(org.logstash.Event.TIMESTAMP));
+                // if timestamp is `org.logstash.Timestamp` type, we convert to IngestDocument compatible timestamp
+                // elsewhere we keep it as it is
+                if (eventValue instanceof org.logstash.Timestamp) {
+                    ZonedDateTime zonedDateTimestamp = ZonedDateTime.ofInstant(((org.logstash.Timestamp) eventValue).toInstant(), UTC);
+                    sourceAndMetadata.putIfAbsent(org.logstash.Event.TIMESTAMP, zonedDateTimestamp);
+                } else {
+                    sourceAndMetadata.putIfAbsent(org.logstash.Event.TIMESTAMP, eventValue);
+                }
             } else if (eventKey.equals(org.logstash.Event.VERSION)) {
                 sourceAndMetadata.putIfAbsent(org.logstash.Event.VERSION, event.getField(org.logstash.Event.VERSION));
             } else {
